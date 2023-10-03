@@ -69,7 +69,7 @@ void GenericPublisher::deserialize_message(
 void GenericPublisher::publish_loaned_message(void * loaned_message)
 {
   auto return_code = rcl_publish_loaned_message(
-    get_publisher_handle().get(), loaned_message, NULL);
+    get_publisher_handle().get(), loaned_message, true, NULL);
 
   if (return_code != RCL_RET_OK) {
     rclcpp::exceptions::throw_from_rcl_error(return_code, "failed to publish loaned message");
