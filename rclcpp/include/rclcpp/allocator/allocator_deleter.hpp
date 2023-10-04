@@ -20,6 +20,10 @@
 
 namespace rclcpp
 {
+
+template<typename ROSMessageType>
+struct ReturnLoanDeleter;
+
 namespace allocator
 {
 
@@ -74,6 +78,14 @@ void set_allocator_for_deleter(D * deleter, Alloc * alloc)
   (void) alloc;
   (void) deleter;
   throw std::runtime_error("Reached unexpected template specialization");
+}
+
+template<typename Alloc, typename ROSMessageType>
+void set_allocator_for_deleter(ReturnLoanDeleter<ROSMessageType> * deleter, Alloc * alloc)
+{
+  (void) alloc;
+  (void) deleter;
+  throw std::runtime_error("Trying to copy a loaned message");
 }
 
 template<typename T, typename U>

@@ -53,6 +53,26 @@ namespace rclcpp
 template<typename MessageT, typename AllocatorT>
 class LoanedMessage;
 
+template<typename ROSMessageType>
+struct ReturnLoanDeleter
+{
+  PublisherBase* pub_;
+
+  void operator ()(ROSMessageType* msg)
+  {
+    // return allocated memory to the middleware
+    auto ret =
+      rcl_return_loaned_message_from_publisher(pub_->get_publisher_handle().get(), msg);
+    if (ret != RCL_RET_OK) {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("LoanedMessage"),
+        "rcl_return_loaned_message_from_publisher failed: %s",
+        rcl_get_error_string().str);
+      rcl_reset_error();
+    }
+  }
+};
+
 /// A publisher publishes messages of any type to a topic.
 /**
  * MessageT must be a:
@@ -528,29 +548,11 @@ protected:
       throw std::runtime_error("cannot publish msg which is a null pointer");
     }
 
-    struct ReturnLoanDeleter
-    {
-      PublisherBase* pub_;
-
-      void operator ()(ROSMessageType* msg)
-      {
-        // return allocated memory to the middleware
-        auto ret =
-          rcl_return_loaned_message_from_publisher(pub_->get_publisher_handle().get(), msg);
-        if (ret != RCL_RET_OK) {
-          RCLCPP_ERROR(
-            rclcpp::get_logger("LoanedMessage"),
-            "rcl_return_loaned_message_from_publisher failed: %s",
-            rcl_get_error_string().str);
-          rcl_reset_error();
-        }
-      }
-    };
-
-    ReturnLoanDeleter deleter;
+    using CustomDeleter = ReturnLoanDeleter<ROSMessageType>;
+    CustomDeleter deleter;
     deleter.pub_ = this;
-    std::unique_ptr<ROSMessageType, ReturnLoanDeleter> msg(raw_msg, deleter);
-    ipm->template do_intra_process_publish<ROSMessageType, ROSMessageType, AllocatorT, ReturnLoanDeleter>(
+    std::unique_ptr<ROSMessageType, CustomDeleter> msg(raw_msg, deleter);
+    ipm->template do_intra_process_publish<ROSMessageType, ROSMessageType, AllocatorT, CustomDeleter>(
       intra_process_publisher_id_,
       std::move(msg),
       ros_message_type_allocator_);
