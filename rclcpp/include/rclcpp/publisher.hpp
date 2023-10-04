@@ -36,6 +36,7 @@
 #include "rclcpp/get_message_type_support_handle.hpp"
 #include "rclcpp/is_ros_compatible_type.hpp"
 #include "rclcpp/loaned_message.hpp"
+#include "rclcpp/logging.hpp"
 #include "rclcpp/macros.hpp"
 #include "rclcpp/node_interfaces/node_base_interface.hpp"
 #include "rclcpp/publisher_base.hpp"
@@ -405,10 +406,6 @@ public:
     if (!loaned_msg.is_valid()) {
       throw std::runtime_error("loaned message is not valid");
     }
-    if (intra_process_is_enabled_) {
-      // TODO(Karsten1987): support loaned message passed by intraprocess
-      throw std::runtime_error("storing loaned messages in intra process is not supported yet");
-    }
 
     // verify that publisher supports loaned messages
     // TODO(Karsten1987): This case separation has to be done in rclcpp
@@ -422,7 +419,7 @@ public:
     } else {
       // we don't release the ownership, let the middleware copy the ros message
       // and thus the destructor of rclcpp::LoanedMessage cleans up the memory.
-      this->do_inter_process_publish(loaned_msg.get());
+      this->publish(loaned_msg.get());
     }
   }
 
@@ -484,21 +481,79 @@ protected:
   do_loaned_message_publish(
     std::unique_ptr<ROSMessageType, std::function<void(ROSMessageType *)>> msg)
   {
-    auto status = rcl_publish_loaned_message(publisher_handle_.get(), msg.get(), true, nullptr);
+    bool return_loan = true;
+    bool inter_process_publish_needed = true;
 
-    if (RCL_RET_PUBLISHER_INVALID == status) {
-      rcl_reset_error();  // next call will reset error message if not context
-      if (rcl_publisher_is_valid_except_context(publisher_handle_.get())) {
-        rcl_context_t * context = rcl_publisher_get_context(publisher_handle_.get());
-        if (nullptr != context && !rcl_context_is_valid(context)) {
-          // publisher is invalid due to context being shutdown
-          return;
+    // Check whether the loan should be returned, and if we need to publish on rcl
+    if (intra_process_is_enabled_) {
+      return_loan = false;
+      inter_process_publish_needed =
+        get_subscription_count() > get_intra_process_subscription_count();
+    }
+
+    // Publish inter-process first, to ensure the loan is not accidentally returned
+    if (inter_process_publish_needed) {
+      auto status =
+        rcl_publish_loaned_message(publisher_handle_.get(), msg.get(), return_loan, nullptr);
+  
+      if (RCL_RET_PUBLISHER_INVALID == status) {
+        rcl_reset_error();  // next call will reset error message if not context
+        if (rcl_publisher_is_valid_except_context(publisher_handle_.get())) {
+          rcl_context_t * context = rcl_publisher_get_context(publisher_handle_.get());
+          if (nullptr != context && !rcl_context_is_valid(context)) {
+            // publisher is invalid due to context being shutdown
+            return;
+          }
         }
       }
+      if (RCL_RET_OK != status) {
+        rclcpp::exceptions::throw_from_rcl_error(status, "failed to publish message");
+      }
     }
-    if (RCL_RET_OK != status) {
-      rclcpp::exceptions::throw_from_rcl_error(status, "failed to publish message");
+
+    if (intra_process_is_enabled_) {
+      do_intra_process_loaned_publish(msg.release());
     }
+  }
+
+  void
+  do_intra_process_loaned_publish(ROSMessageType * raw_msg)
+  {
+    auto ipm = weak_ipm_.lock();
+    if (!ipm) {
+      throw std::runtime_error(
+              "intra process publish called after destruction of intra process manager");
+    }
+    if (!raw_msg) {
+      throw std::runtime_error("cannot publish msg which is a null pointer");
+    }
+
+    struct ReturnLoanDeleter
+    {
+      PublisherBase* pub_;
+
+      void operator ()(ROSMessageType* msg)
+      {
+        // return allocated memory to the middleware
+        auto ret =
+          rcl_return_loaned_message_from_publisher(pub_->get_publisher_handle().get(), msg);
+        if (ret != RCL_RET_OK) {
+          RCLCPP_ERROR(
+            rclcpp::get_logger("LoanedMessage"),
+            "rcl_return_loaned_message_from_publisher failed: %s",
+            rcl_get_error_string().str);
+          rcl_reset_error();
+        }
+      }
+    };
+
+    ReturnLoanDeleter deleter;
+    deleter.pub_ = this;
+    std::unique_ptr<ROSMessageType, ReturnLoanDeleter> msg(raw_msg, deleter);
+    ipm->template do_intra_process_publish<ROSMessageType, ROSMessageType, AllocatorT, ReturnLoanDeleter>(
+      intra_process_publisher_id_,
+      std::move(msg),
+      ros_message_type_allocator_);
   }
 
   void
